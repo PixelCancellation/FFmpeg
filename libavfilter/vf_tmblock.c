@@ -5,6 +5,7 @@
 #include "libavutil/opt.h"
 #include "internal.h"
 #include "bufferqueue.h"
+#include "framesync.h"
 
 #include "tmblock.h"
 
@@ -26,6 +27,7 @@ typedef struct TMBlockContext {
     struct FFBufQueue queue_input, queue_logo;
     TMFunctionType func_type;
     TM_Function *func;
+    FFFrameSync fs;
 } TMBlockContext;
 
 #define OFFSET(x) offsetof(TMBlockContext, x)
@@ -96,47 +98,38 @@ static int draw_frame(AVFilterContext *ctx,
             &tmblock->output, TM_PACKED);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
+static int process_frame(FFFrameSync *fs)
 {
-    AVFilterContext *ctx = inlink->dst;
+    AVFilterContext *ctx = fs->parent;
     TMBlockContext *tmblock = ctx->priv;
     AVFilterLink *output_link = ctx->outputs[0];
+    AVFrame *input_buf, *logo_buf, *output_buf;
 
     int ret = 0;
-    int is_logo = (inlink == ctx->inputs[1]);
-    struct FFBufQueue *queue = 
-        (is_logo ? &tmblock->queue_logo : &tmblock->queue_input);
-    ff_bufqueue_add(ctx, queue, buf);
+    if ((ret = ff_framesync_get_frame(&tmblock->fs, 0, &input_buf, 0)) < 0 ||
+            (ret = ff_framesync_get_frame(&tmblock->fs, 0, &logo_buf, 0)) < 0) {
+        return ret;
+    }
 
-    do {
-        AVFrame *input_buf, *logo_buf, *output_buf;
+    output_buf =
+        ff_get_video_buffer(output_link, output_link->w, output_link->h);
 
-        if (!ff_bufqueue_peek(&tmblock->queue_input, 0) ||
-                !ff_bufqueue_peek(&tmblock->queue_logo, 0)) break;
+    if (!output_buf) {
+        ret = AVERROR(ENOMEM);
+        goto out;
+    }
+    av_frame_copy_props(output_buf, input_buf);
 
-        input_buf = ff_bufqueue_get(&tmblock->queue_input),
-        logo_buf = ff_bufqueue_get(&tmblock->queue_logo);
-        output_buf =
-            ff_get_video_buffer(output_link, output_link->w, output_link->h);
+    if (ret = draw_frame(ctx, input_buf, logo_buf, output_buf))
+        goto out;
 
-        if (!output_buf) {
-            ret = AVERROR(ENOMEM);
-            goto out;
-        }
-
-        av_frame_copy_props(output_buf, input_buf);
-
-        if (ret = draw_frame(ctx, input_buf, logo_buf, output_buf))
-            goto out;
-
-        if (ret = ff_filter_frame(output_link, output_buf))
-            goto out;
+    if (ret = ff_filter_frame(output_link, output_buf))
+        goto out;
 
 out:
-        av_frame_free(&input_buf);
-        av_frame_free(&logo_buf);
-        if (ret) return ret;
-    } while (ret >= 0);
+    av_frame_free(&output_buf);
+    av_frame_free(&input_buf);
+    av_frame_free(&logo_buf);
     return ret;
 }
 
@@ -155,7 +148,9 @@ static av_cold int init(AVFilterContext *ctx) {
         default:
             return 1;
     }
-    return 0;
+
+    tmblock->fs.on_event = process_frame;
+    return ff_framesync_configure(&tmblock->fs);
 }
 
 
@@ -169,12 +164,10 @@ static const AVFilterPad tmblock_inputs[] = {
     {
         .name = "input",
         .type = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
     },
     {
         .name = "logo",
         .type = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
     },
     {NULL}};
 
