@@ -24,7 +24,6 @@ typedef struct TMBlockContext {
     const AVClass *class;
     int offset_x, offset_y;
     TM_Picture input, logo, output;
-    struct FFBufQueue queue_input, queue_logo;
     TMFunctionType func_type;
     TM_Function *func;
     FFFrameSync fs;
@@ -42,7 +41,7 @@ static const AVOption tmblock_options[] = {
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(tmblock);
+FRAMESYNC_DEFINE_CLASS(tmblock, TMBlockContext, fs);
 
 static int query_formats(AVFilterContext *ctx)
 {
@@ -87,7 +86,7 @@ static void copy_AVFrame_to_TM_Picture(TM_Picture *picture, AVFrame *frame) {
     picture->ptr = frame->data[0];
 }
 
-static int draw_frame(AVFilterContext *ctx,
+static int call_tmblock(AVFilterContext *ctx,
         AVFrame *input_buf, AVFrame *logo_buf, AVFrame *output_buf) {
     TMBlockContext *tmblock = ctx->priv;
     copy_AVFrame_to_TM_Picture(&tmblock->input, input_buf);
@@ -98,38 +97,35 @@ static int draw_frame(AVFilterContext *ctx,
             &tmblock->output, TM_PACKED);
 }
 
-static int process_frame(FFFrameSync *fs)
+static int do_tmblock(FFFrameSync *fs)
 {
     AVFilterContext *ctx = fs->parent;
-    TMBlockContext *tmblock = ctx->priv;
     AVFilterLink *output_link = ctx->outputs[0];
-    AVFrame *input_buf, *logo_buf, *output_buf;
+    AVFrame *input_buf = NULL, *logo_buf, *output_buf;
 
     int ret = 0;
-    if ((ret = ff_framesync_get_frame(&tmblock->fs, 0, &input_buf, 0)) < 0 ||
-            (ret = ff_framesync_get_frame(&tmblock->fs, 0, &logo_buf, 0)) < 0) {
-        return ret;
+
+    // NOTO(huiyiqun): logo_buf is owned by the framesync structure,
+    // never release it.
+    if (ret = ff_framesync_dualinput_get(fs, &input_buf, &logo_buf)) {
+        goto out;
     }
 
-    output_buf =
-        ff_get_video_buffer(output_link, output_link->w, output_link->h);
-
-    if (!output_buf) {
+    if ((output_buf = ff_get_video_buffer(
+                    output_link, output_link->w, output_link->h)) == NULL) {
         ret = AVERROR(ENOMEM);
         goto out;
     }
     av_frame_copy_props(output_buf, input_buf);
 
-    if (ret = draw_frame(ctx, input_buf, logo_buf, output_buf))
+    if (ret = call_tmblock(ctx, input_buf, logo_buf, output_buf))
         goto out;
 
     if (ret = ff_filter_frame(output_link, output_buf))
         goto out;
 
 out:
-    av_frame_free(&output_buf);
     av_frame_free(&input_buf);
-    av_frame_free(&logo_buf);
     return ret;
 }
 
@@ -146,18 +142,22 @@ static av_cold int init(AVFilterContext *ctx) {
             tmblock->func = TM_pre;
             break;
         default:
-            return 1;
+            return AVERROR(EINVAL);
     }
 
-    tmblock->fs.on_event = process_frame;
-    return ff_framesync_configure(&tmblock->fs);
+    tmblock->fs.on_event = do_tmblock;
+    return 0;
+}
+
+static int activate(AVFilterContext *ctx) {
+    TMBlockContext *tmblock = ctx->priv;
+    return ff_framesync_activate(&tmblock->fs);
 }
 
 
 static av_cold void uninit(AVFilterContext *ctx) {
     TMBlockContext *tmblock = ctx->priv;
-    ff_bufqueue_discard_all(&tmblock->queue_input);
-    ff_bufqueue_discard_all(&tmblock->queue_logo);
+    ff_framesync_uninit(&tmblock->fs);
 }
 
 static const AVFilterPad tmblock_inputs[] = {
@@ -172,14 +172,20 @@ static const AVFilterPad tmblock_inputs[] = {
     {NULL}};
 
 static int config_output(AVFilterLink *output_link) {
+    int ret;
     AVFilterContext *ctx = output_link->src;
+    TMBlockContext *tmblock = ctx->priv;
     AVFilterLink *input_link = ctx->inputs[0];
     output_link->w = input_link->w;
     output_link->h = input_link->h;
     output_link->time_base = input_link->time_base;
     output_link->sample_aspect_ratio = input_link->sample_aspect_ratio;
     output_link->frame_rate = input_link->frame_rate;
-    return 0;
+    if ((ret = ff_framesync_init_dualinput(&tmblock->fs, ctx)) < 0) {
+        return ret;
+    }
+
+    return ff_framesync_configure(&tmblock->fs);
 }
 
 static const AVFilterPad tmblock_outputs[] = {
@@ -194,6 +200,8 @@ AVFilter ff_vf_tmblock = {
     .name = "tmblock",
     .description = NULL_IF_CONFIG_SMALL("Process the video with TMBlock."),
     .priv_size = sizeof(TMBlockContext),
+    .activate = activate,
+    .preinit = tmblock_framesync_preinit,
     .init = init,
     .uninit = uninit,
     .query_formats = query_formats,
